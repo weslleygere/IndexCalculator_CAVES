@@ -1,209 +1,258 @@
 from __future__ import annotations
 
 import logging
-import time
 import multiprocessing
-from contextlib import nullcontext
+import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+
 from tqdm import tqdm
 
 from .config.settings import Settings
 from .core.audio_loader import AudioLoader
-from .core.params_loader import ConfigParams
-from .core.utils import AudioMetadata, FileScanner, CheckpointManager, CsvWriter
 from .core.idx_processor import AcousticIndexProcessor
-from .core.embedding_processor import EmbeddingProcessor
+from .core.params_loader import ConfigParams
 from .core.pre_processor import PreProcessor
+from .core.utils import AudioMetadata, CheckpointManager, CsvWriter, FileScanner
+
 
 logger = logging.getLogger(__name__)
 
 
-def _init_worker(config: ConfigParams, mode: str, hf_token: str | None = None) -> None:
+_WORKER_LOADER: AudioLoader
+_WORKER_PREPROCESSOR: PreProcessor
+_WORKER_INDEX_PROCESSOR: AcousticIndexProcessor
+
+
+def _init_worker(config: ConfigParams) -> None:
     """
-    Configures each worker in the pool to avoid reloading parameters for every file.
-    
+    Initialize worker-local processors.
+
     Parameters
     ----------
     config : ConfigParams
-        Global audio and indices configuration mapped uniformly to every process.
+        Shared configuration object passed to each worker process.
     """
-    import warnings
-    warnings.simplefilter(action='ignore', category=FutureWarning)
-    warnings.simplefilter(action='ignore', category=RuntimeWarning)
-    
-    global _WORKER_MODE, _WORKER_LOADER, _WORKER_PREPROCESSOR, _WORKER_INDEX_PROCESSOR, _WORKER_EMBEDDING_PROCESSOR
+    warnings.simplefilter(action="ignore", category=FutureWarning)
+    warnings.simplefilter(action="ignore", category=RuntimeWarning)
 
-    _WORKER_MODE = mode
+    global _WORKER_LOADER, _WORKER_PREPROCESSOR, _WORKER_INDEX_PROCESSOR
+
     _WORKER_LOADER = AudioLoader(config=config)
     _WORKER_PREPROCESSOR = PreProcessor(config=config)
-    
-    if mode == "indices":
-        _WORKER_INDEX_PROCESSOR = AcousticIndexProcessor(config=config)
-    elif mode == "embeddings":
-        _WORKER_EMBEDDING_PROCESSOR = EmbeddingProcessor(config=config, hf_token=hf_token)
+    _WORKER_INDEX_PROCESSOR = AcousticIndexProcessor(config=config)
 
 
 def _process_one_file(file_path: Path) -> list[AudioMetadata]:
     """
-    Processes 1 entire file: loads, pre-processes, and extracts indices.
-    
+    Process one WAV file from loading to acoustic index extraction.
+
     Parameters
     ----------
     file_path : Path
-        Absolute filepath to the source WAV.
+        Source WAV path.
 
     Returns
     -------
     list[AudioMetadata]
-        A mapping series holding containers referencing segments computed inside
-        or capturing standard failure exceptions per segment layout.
+        Final segment-level results, or one file-level failure.
     """
-    mode = _WORKER_MODE
-    
     start_time = time.monotonic()
 
-    # 1. Load the audio file
     loaded = _WORKER_LOADER.load_audio(file_path)
     if not loaded.ok:
+        loaded.processing_time = time.monotonic() - start_time
         return [loaded]
 
-    # 2. Pre-process the audio 
-    preprocessed = _WORKER_PREPROCESSOR.process_file(loaded)
-    
-    final_results: list[AudioMetadata] = []
-    for segment in preprocessed:
-        if not segment.ok:
-            final_results.append(segment)
-            continue
-        
-        # 3. Process indices or embeddings based on single pass mode
-        if mode == "indices":
-            final_results.append(_WORKER_INDEX_PROCESSOR.process_file(segment))
-        elif mode == "embeddings":
-            final_results.append(_WORKER_EMBEDDING_PROCESSOR.process_file(segment))
+    segments = _WORKER_PREPROCESSOR.process_file(loaded)
+
+    results: list[AudioMetadata] = []
+
+    for segment in segments:
+        if segment.ok:
+            results.append(_WORKER_INDEX_PROCESSOR.process_file(segment))
+        else:
+            results.append(segment)
 
     processing_time = time.monotonic() - start_time
-    for result in final_results:
-        if result.ok:
-            result.processing_time = processing_time
 
-    return final_results
+    for result in results:
+        result.processing_time = processing_time
+
+    return results
 
 
 class Pipeline:
     """
-    Orchestrates directories, delegating paths to worker pools and writing in real-time.
-    
+    Orchestrate audio scanning, multiprocessing, CSV writing, and checkpointing.
+
     Parameters
     ----------
     settings : Settings
-        The unified and robust typed settings combining runtime config and env context.
+        Runtime settings loaded from the environment.
     """
 
     def __init__(self, settings: Settings) -> None:
         self.output_dir = settings.data.create_output_dir()
         self.data_path = settings.data.data_path
         self.workers = settings.processing.max_workers
-        self.mode = settings.processing.mode
-        self.hf_token = settings.auth.hf_token
         self.config_params = ConfigParams(settings.data.config_params_path)
-    
-    def run(self) -> None:
-        """
-        Executes the main pipeline workload.
-        Creates sequential scans skipping previously logged states (checkpoints)
-        delegating audio computing into pool distributions uniformly persisting real-time updates to CSV.
-        """
-        if self.mode == "both":
-            self._run_single_mode("indices")
-            self._run_single_mode("embeddings")
-            return
 
-        self._run_single_mode(self.mode)
-    
-    def _run_single_mode(self, mode: str) -> None:
-        """Run one full pass for a specific mode."""
+    def execute(self) -> None:
+        """
+        Execute the acoustic index calculation pipeline.
+        """
         scanner = FileScanner(self.data_path)
         checkpoint_mgr = CheckpointManager(
-            self.output_dir,
-            self.data_path,
-            checkpoint_file_name=f"processed_files_checkpoint_{mode}.txt",
+            output_dir=self.output_dir,
+            data_dir=self.data_path,
+            checkpoint_file_name="processed_files_checkpoint.txt",
         )
 
-        workers = self._resolve_workers(mode)
         resume_mode = checkpoint_mgr.check_resume_mode()
 
         logger.info(
-            "Pass: %s | Workers: %s | Resume: %s",
-            mode,
-            workers,
-            'Enabled' if resume_mode else 'Disabled'
+            "Pass: acoustic_indices | Workers: %s | Resume: %s",
+            self.workers,
+            "Enabled" if resume_mode else "Disabled",
         )
 
-        with (
-            CsvWriter(
-                output_file=self.output_dir / f"acoustic_{mode}.csv",
-                error_file=self.output_dir / "acoustic_errors.csv",
-                resume=resume_mode,
-                mode=mode,
-            ) as writer,
+        with CsvWriter(
+            output_file=self.output_dir / "acoustic_indices.csv",
+            error_file=self.output_dir / "acoustic_errors.csv",
+            resume=resume_mode,
+        ) as writer:
+            with ProcessPoolExecutor(
+                max_workers=self.workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_init_worker,
+                initargs=(self.config_params,),
+            ) as executor:
+                self._process_directories(
+                    scanner=scanner,
+                    checkpoint_mgr=checkpoint_mgr,
+                    writer=writer,
+                    executor=executor,
+                )
+
+    def _process_directories(
+        self,
+        scanner: FileScanner,
+        checkpoint_mgr: CheckpointManager,
+        writer: CsvWriter,
+        executor: ProcessPoolExecutor,
+    ) -> None:
+        """
+        Process all discovered directories.
+
+        Parameters
+        ----------
+        scanner : FileScanner
+            Audio file scanner.
+        checkpoint_mgr : CheckpointManager
+            Checkpoint manager.
+        writer : CsvWriter
+            CSV writer.
+        executor : ProcessPoolExecutor
+            Worker pool.
+        """
+        for dir_key, all_paths in scanner.iter_audio_paths_by_directory():
             (
-                ProcessPoolExecutor(
-                    max_workers=workers,
-                    mp_context=multiprocessing.get_context("spawn"),
-                    initializer=_init_worker,
-                    initargs=(self.config_params, mode, self.hf_token),
-                )
-                if workers > 1
-                else nullcontext()
-            ) as executor
-        ):
-            if workers <= 1:
-                _init_worker(self.config_params, mode, self.hf_token)
+                pending_paths,
+                success_count,
+                failed_count,
+                file_failed_count,
+            ) = checkpoint_mgr.check_pending(all_paths)
 
-            for dir_key, all_paths in scanner.iter_audio_paths_by_directory():
-                pending_paths, success_count, failed_count, file_failed_count = checkpoint_mgr.check_pending(all_paths)
-
-                if not pending_paths:
-                    continue
-
+            if not pending_paths:
                 logger.info(
-                    "Processing dir [%s] - %s pending out of %s total files.",
-                    dir_key,
-                    len(pending_paths),
-                    len(all_paths),
-                )
-
-                executor_map = executor.map if executor else map
-                results_iterator = executor_map(_process_one_file, pending_paths)
-
-                progress_bar = tqdm(
-                    zip(pending_paths, results_iterator),
-                    total=len(pending_paths),
-                    bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
-                    ncols=120
-                )
-
-                for path_source, file_results in progress_bar:
-                    writer.consume(file_results)
-
-                    seg_success, seg_failed, file_failed = checkpoint_mgr.mark_completed(path_source, file_results)
-                    success_count += seg_success
-                    failed_count += seg_failed
-                    file_failed_count += file_failed
-
-                logger.info(
-                    "Pass completed dir [%s] | Total Files: %s | Success (segments): %s | Failures (segments): %s | Failures (files): %s.",
+                    "Skipping dir [%s] - all %s files already processed.",
                     dir_key,
                     len(all_paths),
-                    success_count,
-                    failed_count,
-                    file_failed_count,
                 )
+                continue
 
-    def _resolve_workers(self, mode: str) -> int | None:
-        """Resolve workers by pass mode, forcing single worker for GPU pass."""
-        if mode == "embeddings" and self.workers and self.workers > 1:
-            return 1
-        return self.workers
+            logger.info(
+                "Processing dir [%s] - %s pending out of %s total files.",
+                dir_key,
+                len(pending_paths),
+                len(all_paths),
+            )
+
+            counts = self._process_pending_paths(
+                pending_paths=pending_paths,
+                writer=writer,
+                checkpoint_mgr=checkpoint_mgr,
+                executor=executor,
+                initial_counts=(success_count, failed_count, file_failed_count),
+            )
+
+            logger.info(
+                "Completed dir [%s] | Total files: %s | Success segments: %s | Failed segments: %s | Failed files: %s.",
+                dir_key,
+                len(all_paths),
+                counts[0],
+                counts[1],
+                counts[2],
+            )
+
+    def _process_pending_paths(
+        self,
+        pending_paths: list[Path],
+        writer: CsvWriter,
+        checkpoint_mgr: CheckpointManager,
+        executor: ProcessPoolExecutor,
+        initial_counts: tuple[int, int, int],
+    ) -> tuple[int, int, int]:
+        """
+        Process all pending files from one directory.
+
+        Parameters
+        ----------
+        pending_paths : list[Path]
+            Files not present in the checkpoint.
+        writer : CsvWriter
+            CSV writer.
+        checkpoint_mgr : CheckpointManager
+            Checkpoint manager.
+        executor : ProcessPoolExecutor
+            Worker pool.
+        initial_counts : tuple[int, int, int]
+            Previously counted successful segments, failed segments, and
+            file-level failures.
+
+        Returns
+        -------
+        tuple[int, int, int]
+            Updated successful segment count, failed segment count, and
+            file-level failure count.
+        """
+        success_count, failed_count, file_failed_count = initial_counts
+
+        results_iterator = executor.map(_process_one_file, pending_paths)
+
+        progress_bar = tqdm(
+            zip(pending_paths, results_iterator),
+            total=len(pending_paths),
+            bar_format=(
+                "{desc}: {percentage:3.0f}%|{bar}| "
+                "{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
+            ),
+            ncols=120,
+        )
+
+        for source_path, file_results in progress_bar:
+            writer.consume(file_results)
+            writer.flush()
+
+            seg_success, seg_failed, file_failed = checkpoint_mgr.mark_completed(
+                source_path,
+                file_results,
+            )
+
+            success_count += seg_success
+            failed_count += seg_failed
+            file_failed_count += file_failed
+
+        return success_count, failed_count, file_failed_count

@@ -50,28 +50,6 @@ class DatabaseConfig:
 
 
 @dataclass
-class AuthConfig:
-    """
-    Authentication and external service tokens from environment.
-
-    Parameters
-    ----------
-    hf_token : str | None
-        Optional Hugging Face token used for gated/private model access.
-    """
-
-    hf_token: Optional[str]
-
-    @classmethod
-    def from_env(cls) -> "AuthConfig":
-        hf_token = os.getenv("HF_TOKEN")
-        hf_token = hf_token.strip() if hf_token else None
-        return cls(
-            hf_token=hf_token
-        )
-
-
-@dataclass
 class DataConfig:
     """
     Data-related configuration settings.
@@ -187,34 +165,25 @@ class ProcessingConfig:
     """
 
     max_workers: Optional[int]
-    mode: str
 
     def __post_init__(self) -> None:
         """Validate processing settings after initialization."""
         self._validate_max_workers()
-        self._validate_mode()
 
     @classmethod
     def from_env(cls) -> "ProcessingConfig":
         return cls(
             max_workers=int(os.getenv("MAX_WORKERS", "0")),
-            mode=os.getenv("PROCESS_MODE", "indices"),
         )
 
     def _validate_max_workers(self) -> None:
         """Validate MAX_WORKERS value."""
         if self.max_workers == 0:
-            self.max_workers = max(1, (os.cpu_count() or 1)) - 1
+            self.max_workers = max(1, (os.cpu_count() or 1) - 1)
             return
 
         if self.max_workers is not None and self.max_workers < 0:
             raise ValueError("MAX_WORKERS must be 0 (auto) or >= 1")
-
-    def _validate_mode(self) -> None:
-        """Validate PROCESS_MODE value."""
-        self.mode = self.mode.strip().lower()
-        if self.mode not in {"indices", "embeddings", "both"}:
-            raise ValueError("PROCESS_MODE must be one of: indices, embeddings, both")
 
 
 @dataclass
@@ -255,8 +224,6 @@ class Settings:
     ----------
     database : DatabaseConfig
         Database connection settings loaded from environment variables.
-    auth : AuthConfig
-        Authentication settings loaded from environment variables.
     data : DataConfig
         Data-related configuration settings.
     processing : ProcessingConfig
@@ -265,7 +232,6 @@ class Settings:
         Logging configuration settings.
     """
     database: DatabaseConfig
-    auth: AuthConfig
     data: DataConfig
     processing: ProcessingConfig
     logging: LoggingConfig
@@ -274,7 +240,6 @@ class Settings:
     def from_env(cls) -> "Settings":
         return cls(
             database=DatabaseConfig.from_env(),
-            auth=AuthConfig.from_env(),
             data=DataConfig.from_env(),
             processing=ProcessingConfig.from_env(),
             logging=LoggingConfig.from_env()

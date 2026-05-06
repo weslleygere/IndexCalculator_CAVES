@@ -1,52 +1,54 @@
-import os
 import csv
 import logging
+import os
 from dataclasses import dataclass
-from typing import Any, Iterator
 from pathlib import Path
+from typing import Any, Iterator, cast
 
 import numpy as np
 
+
 logger = logging.getLogger(__name__)
+
 
 @dataclass(slots=True)
 class AudioMetadata:
     """
-    Standardized result for audio processing stages (loading, preprocessing).
-    
+    Standardized result container for audio processing stages.
+
     Parameters
     ----------
     stage : str
-        The processing stage (e.g., 'load', 'preprocess').
+        Processing stage name.
     status : str
-        The status of the processing (e.g., 'success', 'failed').
+        Processing status: "success" or "failed".
     file_name : str
-        The name of the audio file.
-    segment_id : str | None
-        Stable segment-level identifier used for cross-run joins.
+        File or segment file name.
+    segment_id : int | None
+        Segment identifier within the source file, or None for file-level results.
     directory_name : str | None
-        Parent directory name used to disambiguate identical file names.
+        Parent directory name.
     wave : np.ndarray | None
-        The audio waveform data.
+        Audio waveform data.
     acoustic_idx : dict[str, Any] | None
-        A dictionary containing acoustic indices for the audio file.  
-    embeddings : dict[str, Any] | None
-        A dictionary containing pooled embedding values for the audio file.
+        Acoustic index values.
     sample_rate : int | None
-        The sample rate of the audio data.
+        Audio sample rate.
+    processing_time : float | None
+        File-level processing time in seconds.
     error : str | None
-        Error message if the processing failed.
+        Error message when status is "failed".
     error_type : str | None
-        Type of the error if the processing failed.
+        Error type when status is "failed".
     """
+
     stage: str
     status: str
     file_name: str
-    segment_id: str | None = None
+    segment_id: int | None = None
     directory_name: str | None = None
     wave: np.ndarray | None = None
     acoustic_idx: dict[str, Any] | None = None
-    embeddings: dict[str, Any] | None = None
     sample_rate: int | None = None
     processing_time: float | None = None
     error: str | None = None
@@ -54,37 +56,196 @@ class AudioMetadata:
 
     @property
     def ok(self) -> bool:
+        """
+        Whether the processing result is successful.
+
+        Returns
+        -------
+        bool
+            True if status is "success", otherwise False.
+        """
         return self.status == "success"
+
+    @classmethod
+    def fail(
+        cls,
+        stage: str,
+        file_name: str,
+        *,
+        segment_id: int | None = None,
+        directory_name: str | None = None,
+        error: str | None = None,
+        error_type: str | None = None,
+        sample_rate: int | None = None,
+        processing_time: float | None = None,
+    ) -> "AudioMetadata":
+        """
+        Build a failed metadata record.
+
+        Parameters
+        ----------
+        stage : str
+            Processing stage name.
+        file_name : str
+            File or segment file name.
+        segment_id : int | None
+            Segment identifier.
+        directory_name : str | None
+            Parent directory name.
+        error : str | None
+            Error message.
+        error_type : str | None
+            Error type.
+        sample_rate : int | None
+            Audio sample rate.
+        processing_time : float | None
+            File-level processing time in seconds.
+
+        Returns
+        -------
+        AudioMetadata
+            Failed metadata record.
+        """
+        return cls(
+            stage=stage,
+            status="failed",
+            file_name=file_name,
+            segment_id=segment_id,
+            directory_name=directory_name,
+            sample_rate=sample_rate,
+            processing_time=processing_time,
+            error=error,
+            error_type=error_type,
+        )
+
+    @classmethod
+    def success(
+        cls,
+        stage: str,
+        file_name: str,
+        *,
+        segment_id: int | None = None,
+        directory_name: str | None = None,
+        wave: np.ndarray | None = None,
+        acoustic_idx: dict[str, Any] | None = None,
+        sample_rate: int | None = None,
+        processing_time: float | None = None,
+    ) -> "AudioMetadata":
+        """
+        Build a successful metadata record.
+
+        Parameters
+        ----------
+        stage : str
+            Processing stage name.
+        file_name : str
+            File or segment file name.
+        segment_id : int | None
+            Segment identifier.
+        directory_name : str | None
+            Parent directory name.
+        wave : np.ndarray | None
+            Audio waveform data.
+        acoustic_idx : dict[str, Any] | None
+            Acoustic index values.
+        sample_rate : int | None
+            Audio sample rate.
+        processing_time : float | None
+            File-level processing time in seconds.
+
+        Returns
+        -------
+        AudioMetadata
+            Successful metadata record.
+        """
+        return cls(
+            stage=stage,
+            status="success",
+            file_name=file_name,
+            segment_id=segment_id,
+            directory_name=directory_name,
+            wave=wave,
+            acoustic_idx=acoustic_idx,
+            sample_rate=sample_rate,
+            processing_time=processing_time,
+            error=None,
+            error_type=None,
+        )
+
+    def require_wave(self, message: str = "Missing waveform") -> np.ndarray:
+        """
+        Return waveform or raise if missing.
+
+        Parameters
+        ----------
+        message : str
+            Error message for missing waveform.
+
+        Returns
+        -------
+        np.ndarray
+            Waveform array.
+        """
+        if self.wave is None:
+            raise ValueError(message)
+
+        return cast(np.ndarray, self.wave)
+
+    def require_sample_rate(self, message: str = "Missing sample rate") -> int:
+        """
+        Return sample rate or raise if missing.
+
+        Parameters
+        ----------
+        message : str
+            Error message for missing sample rate.
+
+        Returns
+        -------
+        int
+            Sample rate.
+        """
+        if self.sample_rate is None:
+            raise ValueError(message)
+
+        return cast(int, self.sample_rate)
 
 
 class FileScanner:
     """
-    Scans directories for audio files and manages path resolution for checkpoints.
-    
+    Recursively scan a directory for WAV files grouped by parent directory.
+
     Parameters
     ----------
     data_dir : Path | str
-        Directory containing WAV files. Search is recursive.
+        Base directory containing WAV files.
     """
+
     def __init__(self, data_dir: Path | str) -> None:
         self.data_dir = Path(data_dir).resolve()
 
     def iter_audio_paths_by_directory(self) -> Iterator[tuple[str, list[Path]]]:
         """
-        Yield WAV file paths grouped by directory (deterministic order).
+        Yield WAV file paths grouped by directory in deterministic order.
 
         Yields
         ------
         tuple[str, list[Path]]
-            (directory_key, list_of_wav_paths)
+            Directory key and list of WAV paths.
         """
         for root, dirs, files in os.walk(self.data_dir):
             dirs.sort()
-            wav_files = sorted(file for file in files if file.lower().endswith(".wav"))
+
+            wav_files = sorted(
+                file for file in files
+                if file.lower().endswith(".wav")
+            )
+
             if not wav_files:
                 continue
 
             root_path = Path(root)
+
             try:
                 directory_key = root_path.relative_to(self.data_dir).as_posix()
             except ValueError:
@@ -98,138 +259,205 @@ class FileScanner:
 
 class CheckpointManager:
     """
-    Manages the parsing, loading, and appending of processed file states.
-    
+    Manage processed-file checkpoint records.
+
     Parameters
     ----------
     output_dir : Path | str
-        Directory to hold the checkpoint txt file.
+        Directory where the checkpoint file is stored.
     data_dir : Path | str
-        Base directory containing input WAV files, used to compute relative paths.
+        Base input directory used to compute relative checkpoint keys.
+    checkpoint_file_name : str
+        Checkpoint file name.
     """
-    def __init__(self, output_dir: Path | str, data_dir: Path | str, checkpoint_file_name: str = "processed_files_checkpoint.txt"):
+
+    def __init__(
+        self,
+        output_dir: Path | str,
+        data_dir: Path | str,
+        checkpoint_file_name: str = "processed_files_checkpoint.txt",
+    ) -> None:
         self.output_dir = Path(output_dir).resolve()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
         self.checkpoint_path = self.output_dir / checkpoint_file_name
         self.data_dir_abs = Path(data_dir).resolve()
+
         self.records: dict[str, tuple[int, int, int]] = {}
 
     def check_resume_mode(self) -> bool:
         """
-        Loads the checkpoint, populates internal records, and states if resuming.
-        
+        Load checkpoint records if available.
+
         Returns
         -------
         bool
-            True if previous successful records were loaded, indicating resume mode.
-            False if checkpoint doesn't exist or is empty.
+            True if checkpoint records were loaded.
         """
         if not self.checkpoint_path.exists():
             return False
-            
-        with open(self.checkpoint_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+
+        with self.checkpoint_path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                parsed = self._parse_checkpoint_line(line)
+                if parsed is None:
                     continue
-                parts = line.split("|")
-                if len(parts) == 4:
-                    # New format: path|seg_success|seg_failed|file_failed
-                    self.records[parts[0]] = (int(parts[1]), int(parts[2]), int(parts[3]))
-                elif len(parts) == 3:
-                    # Previous format: path|seg_success|seg_failed
-                    self.records[parts[0]] = (int(parts[1]), int(parts[2]), 0)
-                elif len(parts) == 2:
-                    # Legacy format: path|success or path|failed
-                    is_success = (parts[1] == "success")
-                    self.records[parts[0]] = (1 if is_success else 0, 0, 0 if is_success else 1)
-                else:
-                    # Legacy fallback
-                    self.records[line] = (1, 0, 0)
-        return len(self.records) > 0
+
+                key, counts = parsed
+                self.records[key] = counts
+
+        return bool(self.records)
 
     def check_pending(self, paths: list[Path]) -> tuple[list[Path], int, int, int]:
         """
-        Filters out already processed paths based on loaded records.
-        
+        Split paths into pending files and previously counted records.
+
         Parameters
         ----------
         paths : list[Path]
-            A list of file paths to check against loaded checkpoints.
+            Input file paths.
 
         Returns
         -------
         tuple[list[Path], int, int, int]
-            A tuple containing:
-            - A list of paths left to be processed.
-            - Total number of prior segments successes.
-            - Total number of prior segments failures.
-            - Total number of prior file-level failures.
+            Pending paths, prior successful segments, prior failed segments,
+            and prior file-level failures.
         """
-        pending = []
+        pending: list[Path] = []
         seg_success = 0
         seg_failed = 0
         file_failed = 0
-        for p in paths:
-            key = self._get_key(p)
-            if key in self.records:
-                s, f, ff = self.records[key]
-                seg_success += s
-                seg_failed += f
-                file_failed += ff
-            else:
-                pending.append(p)
+
+        for path in paths:
+            key = self._get_key(path)
+
+            if key not in self.records:
+                pending.append(path)
+                continue
+
+            success_count, failed_count, file_failed_count = self.records[key]
+            seg_success += success_count
+            seg_failed += failed_count
+            file_failed += file_failed_count
+
         return pending, seg_success, seg_failed, file_failed
 
     def mark_completed(self, file_path: Path, results: list[AudioMetadata]) -> tuple[int, int, int]:
         """
-        Evaluates processing final state from segments, appending to checkpoint.
-        
+        Append the final file state to the checkpoint.
+
         Parameters
         ----------
         file_path : Path
-            The absolute or relative path to the original audio file.
+            Original source audio file path.
         results : list[AudioMetadata]
-            The list of calculated results for segments derived from this file.
-            
+            Final processing results for the file.
+
         Returns
         -------
         tuple[int, int, int]
-            The number of successful segments, failed segments, and failed files (if failure happened before segmentation).
+            Successful segment count, failed segment count, and file-level
+            failure count.
         """
-        seg_success_count = 0
-        seg_failed_count = 0
-        file_failed_count = 0
-        
-        # If the failure happened in the load step, we have exactly 1 result representing the whole file
-        if len(results) == 1 and not results[0].ok and results[0].stage == "load":
-            file_failed_count = 1
-        else:
-            seg_success_count = sum(1 for c in results if c.ok)
-            seg_failed_count = len(results) - seg_success_count
-            
+        seg_success, seg_failed, file_failed = self._count_results(results)
         key = self._get_key(file_path)
-        
-        with open(self.checkpoint_path, "a", encoding="utf-8") as f:
-            f.write(f"{key}|{seg_success_count}|{seg_failed_count}|{file_failed_count}\n")
-            
-        self.records[key] = (seg_success_count, seg_failed_count, file_failed_count)
-        return seg_success_count, seg_failed_count, file_failed_count
+
+        with self.checkpoint_path.open("a", encoding="utf-8") as stream:
+            stream.write(f"{key}|{seg_success}|{seg_failed}|{file_failed}\n")
+            stream.flush()
+
+        self.records[key] = (seg_success, seg_failed, file_failed)
+
+        return seg_success, seg_failed, file_failed
+
+    @staticmethod
+    def _count_results(results: list[AudioMetadata]) -> tuple[int, int, int]:
+        """
+        Count successful segments, failed segments, and file-level failures.
+
+        Parameters
+        ----------
+        results : list[AudioMetadata]
+            Final processing results.
+
+        Returns
+        -------
+        tuple[int, int, int]
+            Successful segment count, failed segment count, and file-level
+            failure count.
+        """
+        if not results:
+            return 0, 0, 1
+
+        if len(results) == 1 and not results[0].ok and results[0].stage == "load":
+            return 0, 0, 1
+
+        seg_success = sum(1 for result in results if result.ok)
+        seg_failed = sum(1 for result in results if not result.ok)
+
+        return seg_success, seg_failed, 0
+
+    @staticmethod
+    def _parse_checkpoint_line(
+        line: str,
+    ) -> tuple[str, tuple[int, int, int]] | None:
+        """
+        Parse one checkpoint line.
+
+        Parameters
+        ----------
+        line : str
+            Raw checkpoint line.
+
+        Returns
+        -------
+        tuple[str, tuple[int, int, int]] | None
+            Parsed key and counts, or None for invalid empty lines.
+        """
+        line = line.strip()
+
+        if not line:
+            return None
+
+        parts = line.split("|")
+
+        try:
+            if len(parts) == 4:
+                return parts[0], (int(parts[1]), int(parts[2]), int(parts[3]))
+
+            if len(parts) == 3:
+                return parts[0], (int(parts[1]), int(parts[2]), 0)
+
+            if len(parts) == 2:
+                is_success = parts[1] == "success"
+                return parts[0], (
+                    1 if is_success else 0,
+                    0,
+                    0 if is_success else 1,
+                )
+
+            return line, (1, 0, 0)
+
+        except ValueError:
+            logger.warning("Ignoring invalid checkpoint line: %s", line)
+            return None
 
     def _get_key(self, file_path: Path | str) -> str:
         """
-        Computes a relative key for the checkpoint record based on the file path.
-        
+        Compute a stable checkpoint key for a file path.
+
         Parameters
         ----------
         file_path : Path | str
-            The absolute or relative path to the original audio file.
-            
+            File path.
+
         Returns
         -------
         str
-             A relative path key for checkpointing, or just the file name if relative path cannot be computed.
+            Relative path when possible, otherwise file name.
         """
         abs_file_path = Path(file_path).resolve()
+
         try:
             return abs_file_path.relative_to(self.data_dir_abs).as_posix()
         except ValueError:
@@ -238,33 +466,44 @@ class CheckpointManager:
 
 class CsvWriter:
     """
-    Stream processing outputs to CSV files and maintain execution summary.
+    Stream acoustic index results and errors to CSV files.
 
-    Two CSV files are produced:
-    - acoustic_[mode].csv: successful acoustic index or embedding rows
-    - acoustic_errors.csv: failures from any stage
-    
     Parameters
     ----------
     output_file : str | Path
-        Path to the primary CSV output (acoustic indices).
+        Acoustic indices CSV path.
     error_file : str | Path
-        Path to the errors CSV output.
+        Error CSV path.
     resume : bool
-        If True, appends to existing CSVs and infers headers from them.
+        If True, append to an existing data CSV when available.
     """
+
+    BASE_DATA_FIELDS = [
+        "directory_name",
+        "file_name",
+        "segment_id",
+        "sample_rate",
+        "processing_time",
+    ]
+
+    ERROR_FIELDS = [
+        "stage",
+        "directory_name",
+        "file_name",
+        "segment_id",
+        "error",
+        "error_type",
+    ]
 
     def __init__(
         self,
         output_file: str | Path,
         error_file: str | Path,
         resume: bool = False,
-        mode: str = "indices",
     ) -> None:
         self.output_file = Path(output_file)
         self.error_file = Path(error_file)
         self.resume = resume
-        self.mode = mode
 
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
         self.error_file.parent.mkdir(parents=True, exist_ok=True)
@@ -273,111 +512,179 @@ class CsvWriter:
         self._data_writer: csv.DictWriter[str] | None = None
         self._data_fieldnames: list[str] = []
         self._warned_extra_keys = False
-        
-        self._initialize_data_writer_for_resume_if_needed()
 
-        # Always append to error_file if it exists to preserve errors from prior passes (e.g. indices then embeddings)
-        error_exists = self.error_file.exists() and self.error_file.stat().st_size > 0
-        self._errors_stream = self.error_file.open("a" if error_exists else "w", newline="", encoding="utf-8")
-        self._errors_writer = csv.DictWriter(
-            self._errors_stream,
-            fieldnames=[
-                "stage",
-                "directory_name",
-                "file_name",
-                "error",
-                "error_type",
-            ],
-        )
-        if not error_exists:
-            self._errors_writer.writeheader()
+        self._errors_stream = None
+        self._errors_writer: csv.DictWriter[str] | None = None
 
     def __enter__(self) -> "CsvWriter":
-        """Support for context manager protocol to ensure proper resource management."""
+        """
+        Enter context manager.
+
+        Returns
+        -------
+        CsvWriter
+            Current writer instance.
+        """
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Ensure that all open file streams are properly closed when exiting the context."""
+        """
+        Exit context manager and close file handles.
+        """
         self.close()
 
     def consume(self, file_results: list[AudioMetadata]) -> None:
         """
-        Consume and persist all stage outputs produced for one input file.
-        
+        Write all final results from one source file.
+
         Parameters
         ----------
         file_results : list[AudioMetadata]
-            The chunk of calculated metadata results to inject into either the
-            success log (indices CSV) or the error log (errors CSV).
+            Final processing results.
         """
-        
+        if not file_results:
+            logger.warning("Received empty result list; no CSV row was written")
+            return
+
         for result in file_results:
             if result.ok:
-                self._write_success_row(result)
+                self._write_success(result)
             else:
-                self._write_error_row(result)
+                self._write_error(result)
+
+    def flush(self) -> None:
+        """
+        Flush open CSV streams.
+        """
+        if self._data_stream is not None:
+            self._data_stream.flush()
+
+        if self._errors_stream is not None:
+            self._errors_stream.flush()
 
     def close(self) -> None:
-        """Flush and close open CSV files."""
+        """
+        Flush and close CSV streams.
+        """
         if self._data_writer is None:
-            self._data_fieldnames = ["directory_name", "file_name", "sample_rate", "processing_time"]
-            self._data_stream = self.output_file.open("w", newline="", encoding="utf-8")
-            self._data_writer = csv.DictWriter(self._data_stream, fieldnames=self._data_fieldnames)
-            self._data_writer.writeheader()
+            self._ensure_data_writer(fieldnames=self.BASE_DATA_FIELDS)
+
+        self.flush()
 
         if self._data_stream is not None:
             self._data_stream.close()
+            self._data_stream = None
 
-        self._errors_stream.close()
+        if self._errors_stream is not None:
+            self._errors_stream.close()
+            self._errors_stream = None
 
-    def _initialize_data_writer_for_resume_if_needed(self) -> None:
-        """Open data CSV in append mode if a resumable file already exists."""
-        data_exists = self.resume and self.output_file.exists() and self.output_file.stat().st_size > 0
-        if not data_exists:
+    def _ensure_data_writer(self, fieldnames: list[str]) -> None:
+        """
+        Ensure the data CSV writer is ready.
+
+        Parameters
+        ----------
+        fieldnames : list[str]
+            Data CSV field names.
+        """
+        if self._data_writer is not None:
             return
 
+        header = None
+        data_exists = (
+            self.resume
+            and self.output_file.exists()
+            and self.output_file.stat().st_size > 0
+        )
+
+        if data_exists:
+            header = self._read_data_header()
+
+        if header:
+            self._data_fieldnames = header
+            self._data_stream = self.output_file.open("a", newline="", encoding="utf-8")
+        else:
+            self._data_fieldnames = fieldnames
+            self._data_stream = self.output_file.open("w", newline="", encoding="utf-8")
+
+        self._data_writer = csv.DictWriter(
+            self._data_stream,
+            fieldnames=self._data_fieldnames,
+        )
+
+        if not header:
+            self._data_writer.writeheader()
+
+    def _read_data_header(self) -> list[str] | None:
+        """
+        Read the header from an existing data CSV file.
+
+        Returns
+        -------
+        list[str] | None
+            Header list if present.
+        """
         with self.output_file.open("r", newline="", encoding="utf-8") as stream:
             reader = csv.reader(stream)
             header = next(reader, None)
 
-        if not header:
+        return header if header else None
+
+    def _ensure_error_writer(self) -> None:
+        """
+        Ensure the error CSV writer is ready.
+        """
+        if self._errors_writer is not None:
             return
 
-        self._data_fieldnames = header
-        self._data_stream = self.output_file.open("a", newline="", encoding="utf-8")
-        self._data_writer = csv.DictWriter(self._data_stream, fieldnames=self._data_fieldnames)
+        error_exists = self.error_file.exists() and self.error_file.stat().st_size > 0
+        mode = "a" if error_exists else "w"
 
-    def _write_success_row(self, result: AudioMetadata) -> None:
+        self._errors_stream = self.error_file.open(mode, newline="", encoding="utf-8")
+        self._errors_writer = csv.DictWriter(
+            self._errors_stream,
+            fieldnames=self.ERROR_FIELDS,
+        )
+
+        if not error_exists:
+            self._errors_writer.writeheader()
+
+    def _write_success(self, result: AudioMetadata) -> None:
         """
-        Write one successful data row to the CSV.
-        
+        Write one successful acoustic index row.
+
         Parameters
         ----------
         result : AudioMetadata
-            The successful processing result containing data to log.
+            Successful acoustic index result.
         """
-        data = result.acoustic_idx if self.mode == "indices" else result.embeddings
-        if data:
-            self._write_data_row(result, data)
-
-    def _write_data_row(self, result: AudioMetadata, data: dict[str, Any]) -> None:
-        """Write one data row to the CSV."""
+        if not result.acoustic_idx:
+            self._write_error(
+                AudioMetadata.fail(
+                    stage=result.stage,
+                    file_name=result.file_name,
+                    segment_id=result.segment_id,
+                    directory_name=result.directory_name,
+                    sample_rate=result.sample_rate,
+                    processing_time=result.processing_time,
+                    error="Successful result without acoustic_idx",
+                    error_type="MissingAcousticIndicesError",
+                )
+            )
+            return
 
         if self._data_writer is None:
-            self._data_fieldnames = ["directory_name", "file_name", "sample_rate", "processing_time"] + sorted(data.keys())
-            self._data_stream = self.output_file.open("w", newline="", encoding="utf-8")
-            self._data_writer = csv.DictWriter(self._data_stream, fieldnames=self._data_fieldnames)
-            self._data_writer.writeheader()
+            fieldnames = self.BASE_DATA_FIELDS + sorted(result.acoustic_idx.keys())
+            self._ensure_data_writer(fieldnames)
 
-        row: dict[str, Any] = {
-            "directory_name": result.directory_name,
-            "file_name": result.file_name,
-            "sample_rate": "" if result.sample_rate is None else result.sample_rate,
-            "processing_time": "" if result.processing_time is None else round(result.processing_time, 2),
-        }
+        if self._data_writer is None:
+            raise RuntimeError("Data writer was not initialized")
+
+        row: dict[str, Any] = self._base_data_row(result)
 
         extra_keys = []
-        for key, value in data.items():
+        for key, value in result.acoustic_idx.items():
             if key in self._data_fieldnames:
                 row[key] = value
             else:
@@ -385,28 +692,62 @@ class CsvWriter:
 
         if extra_keys and not self._warned_extra_keys:
             logger.warning(
-                "Additional data keys were ignored because CSV header is fixed after first row: %s",
+                "Ignoring acoustic index keys not present in CSV header: %s",
                 sorted(extra_keys),
             )
             self._warned_extra_keys = True
 
         self._data_writer.writerow(row)
 
-    def _write_error_row(self, result: AudioMetadata) -> None:
+    def _write_error(self, result: AudioMetadata) -> None:
         """
-        Write one failed stage output to the errors CSV.
-        
+        Write one error row.
+
         Parameters
         ----------
         result : AudioMetadata
-            The failed processing result containing error information to log.
+            Failed processing result.
         """
+        if self._errors_writer is None:
+            self._ensure_error_writer()
+
+        if self._errors_writer is None:
+            raise RuntimeError("Error writer was not initialized")
+
         self._errors_writer.writerow(
             {
                 "stage": result.stage,
                 "directory_name": result.directory_name,
                 "file_name": result.file_name,
+                "segment_id": result.segment_id,
                 "error": result.error,
                 "error_type": result.error_type,
             }
         )
+
+    @classmethod
+    def _base_data_row(cls, result: AudioMetadata) -> dict[str, Any]:
+        """
+        Build base metadata row for the acoustic indices CSV.
+
+        Parameters
+        ----------
+        result : AudioMetadata
+            Successful acoustic index result.
+
+        Returns
+        -------
+        dict[str, Any]
+            Base row.
+        """
+        return {
+            "directory_name": result.directory_name,
+            "file_name": result.file_name,
+            "segment_id": result.segment_id,
+            "sample_rate": "" if result.sample_rate is None else result.sample_rate,
+            "processing_time": (
+                ""
+                if result.processing_time is None
+                else round(result.processing_time, 2)
+            ),
+        }

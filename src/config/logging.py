@@ -4,7 +4,6 @@ import platform
 from logging import Filter
 from datetime import datetime
 from pathlib import Path
-import torch
 
 from .settings import Settings
 
@@ -49,7 +48,7 @@ class LogSetup:
 
     def __init__(self, settings: "Settings") -> None:
         self.log_level = settings.logging.log_level
-        self.output_dir = settings.data.output_dir
+        self.output_dir = settings.data.create_output_dir()
         self.config_params_path = settings.data.config_params_path
 
     @staticmethod
@@ -97,7 +96,6 @@ class LogSetup:
             f"Output Directory: {self.output_dir}",
             f"Platform        : {platform.system()} {platform.release()}",
             f"Python Version  : {platform.python_version()}",
-            f"Cuda Available   : {torch.cuda.is_available() if 'torch' in globals() else 'N/A'}",
         ]
 
         env_path = Path(".env")

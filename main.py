@@ -1,37 +1,35 @@
 import logging
 
-from src.pipeline import Pipeline
 from src.config.logging import LogSetup
 from src.config.settings import Settings
+from src.pipeline import Pipeline
 
 
 def main() -> None:
     """
-    Main entry point for the PAM pipeline.
+    Run the PAM acoustic index pipeline.
     """
-    
     LogSetup.setup_bootstrap_logging()
     logger = logging.getLogger(__name__)
 
-    logging_setup = None
+    logging_setup: LogSetup | None = None
 
     try:
         settings = Settings.from_env()
-        settings.data.create_output_dir()
 
         logging_setup = LogSetup(settings=settings)
         logging_setup.setup_logging()
-
-        logger.info("Starting pipeline...")
         logging_setup.write_log_metadata()
 
+        logger.info("Starting acoustic index pipeline...")
+
         pipeline = Pipeline(settings=settings)
-        pipeline.run()
+        pipeline.execute()
 
-        logger.info(f"Evaluation complete. Results saved to {settings.data.output_dir}")
+        logger.info("Acoustic index pipeline completed successfully.")
 
-    except Exception as e:
-        logger.critical(f"An unexpected error occurred: {e}", exc_info=True)
+    except Exception:
+        logger.exception("An unexpected error occurred during pipeline execution.")
 
     finally:
         if logging_setup is not None:
@@ -40,3 +38,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    

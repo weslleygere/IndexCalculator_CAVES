@@ -1,19 +1,16 @@
 from pathlib import Path
 
-from maad import sound
 import numpy as np
+from maad import sound
 
 from .params_loader import ConfigParams
 from .utils import AudioMetadata
 
-import logging
-logger = logging.getLogger(__name__)
-
 
 class AudioLoader:
     """
-    Load audio files from a directory using channel/detrend settings from config.
-    
+    Load WAV files using channel and detrend settings from configuration.
+
     Parameters
     ----------
     config : ConfigParams
@@ -26,41 +23,65 @@ class AudioLoader:
 
     def load_audio(self, file_path: Path | str) -> AudioMetadata:
         """
-        Load a single WAV file.
+        Load one WAV file.
 
         Parameters
         ----------
         file_path : Path | str
-            Path to the audio file.
+            Path to the WAV file.
 
         Returns
         -------
         AudioMetadata
-            Standardized load result including status, payload and error metadata.
+            Loaded audio metadata or a failed metadata object.
         """
-        path_obj = Path(file_path).resolve()
-        directory_name = path_obj.parent.name
+        path = Path(file_path).resolve()
 
         try:
-            wave, sr = sound.load(str(path_obj), channel=self.channel, detrend=self.detrend)
-            return AudioMetadata(
-                stage="load",
-                status="success",
-                file_name=path_obj.name,
-                segment_id=path_obj.name,
-                directory_name=directory_name,
-                wave=np.asarray(wave, dtype=np.float32),
-                sample_rate=sr,
+            wave, sample_rate = sound.load(
+                str(path),
+                channel=self.channel,
+                detrend=self.detrend,
             )
 
-        except Exception as e:
-            return AudioMetadata(
+            if wave is None:
+                raise ValueError("Loaded waveform is None")
+
+            if sample_rate is None:
+                raise ValueError("Loaded sample rate is None")
+
+            return AudioMetadata.success(
                 stage="load",
-                status="failed",
-                file_name=path_obj.name,
-                segment_id=path_obj.name,
-                directory_name=directory_name,
-                error=str(e),
-                error_type=type(e).__name__,
+                file_name=path.name,
+                directory_name=path.parent.name,
+                wave=np.asarray(wave, dtype=np.float32),
+                sample_rate=int(sample_rate),
             )
-        
+
+        except Exception as exc:
+            return self._fail(path, exc)
+
+    @staticmethod
+    def _fail(path: Path, exc: Exception) -> AudioMetadata:
+        """
+        Build a failed load result.
+
+        Parameters
+        ----------
+        path : Path
+            Source audio path.
+        exc : Exception
+            Raised exception.
+
+        Returns
+        -------
+        AudioMetadata
+            Failed load metadata.
+        """
+        return AudioMetadata.fail(
+            stage="load",
+            file_name=path.name,
+            directory_name=path.parent.name,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )

@@ -1,22 +1,19 @@
-import logging
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
-from maad import sound, features
+from maad import features, sound
 
 from .params_loader import ConfigParams
 from .utils import AudioMetadata
 
 
-logger = logging.getLogger(__name__)
-
-
 class AcousticIndexProcessor:
     """
-    Compute acoustic indices for one preprocessed audio container.
+    Compute acoustic indices for one preprocessed audio segment.
 
-    The processor computes temporal and spectral alpha indices and returns them
-    in a standardized AudioMetadata payload under acoustic_idx.
+    The processor mutates the received AudioMetadata object in place by adding
+    acoustic_idx values and clearing the waveform after computation. If any
+    index is invalid, the whole segment is marked as failed.
 
     Parameters
     ----------
@@ -25,88 +22,88 @@ class AcousticIndexProcessor:
     """
 
     def __init__(self, config: ConfigParams) -> None:
-        # Spectrogram parameters
-        self.nperseg = config.nperseg
-        self.noverlap = config.noverlap
-
-        # Spectral indices parameters
-        self.flim_low = config.flim_low
-        self.flim_mid = config.flim_mid
-        self.flim_hi = config.flim_hi
-        self.db_threshold = config.dB_threshold
-        self.fmin = config.fmin
-        self.fmax = config.fmax
-        self.bin_step = config.bin_step
-        self.flim_bio = config.flim_bio
-        self.flim_anthro = config.flim_anthro
-        self.flim_bioacoustics = config.flim_bioacoustics
-        self.r_compatible = config.R_compatible
-
-        # Temporal indices parameters
-        self.mode = config.mode
-        self.nt = config.Nt
+        self.flims = config.flims
         self.compatibility = config.compatibility
-
 
     def process_file(self, audio: AudioMetadata) -> AudioMetadata:
         """
-        Calculate acoustic indices for one preprocessed audio container.
+        Calculate acoustic indices for one preprocessed audio segment.
 
         Parameters
         ----------
         audio : AudioMetadata
-            Preprocessed input container containing waveform and sample rate.
+            Preprocessed segment containing waveform and sample rate.
 
         Returns
         -------
         AudioMetadata
-            Success container with acoustic_idx values, or failed container with
-            error metadata if calculation fails.
+            The same input object, updated in place as either success or failed.
         """
         try:
-            wave = cast(np.ndarray, audio.wave)
-            sample_rate = cast(int, audio.sample_rate)
-
-            values: dict[str, Any] = {}
-
-            # Step 1: Compute temporal indices
-            values.update(self._compute_temporal_indices(wave, sample_rate))
-            
-            # Step 2: Compute spectral indices
-            values.update(self._compute_spectral_indices(wave, sample_rate))
-
-            return AudioMetadata(
-                stage="acoustic_idx",
-                status="success",
-                file_name=audio.file_name,
-                segment_id=audio.segment_id,
-                directory_name=audio.directory_name,
-                acoustic_idx=values,
-                sample_rate=sample_rate,
+            wave = audio.require_wave("Missing waveform for acoustic index calculation")
+            sample_rate = audio.require_sample_rate(
+                "Missing sample rate for acoustic index calculation"
             )
+
+            acoustic_idx = self._compute_indices(wave, sample_rate)
+            self._validate_indices(acoustic_idx)
+
+            audio.stage = "acoustic_idx"
+            audio.status = "success"
+            audio.acoustic_idx = acoustic_idx
+            audio.sample_rate = sample_rate
+            audio.error = None
+            audio.error_type = None
 
         except Exception as exc:
-            return AudioMetadata(
-                stage="acoustic_idx",
-                status="failed",
-                file_name=audio.file_name,
-                segment_id=audio.segment_id,
-                directory_name=audio.directory_name,
-                error=str(exc),
-                error_type=type(exc).__name__,
-                sample_rate=audio.sample_rate,
-            )
+            audio.stage = "acoustic_idx"
+            audio.status = "failed"
+            audio.acoustic_idx = None
+            audio.error = str(exc)
+            audio.error_type = type(exc).__name__
 
-    def _compute_temporal_indices(self, wave: np.ndarray, sample_rate: int) -> dict[str, Any]:
+        finally:
+            audio.wave = None
+
+        return audio
+
+    def _compute_indices(self, wave: np.ndarray, sample_rate: int) -> dict[str, Any]:
         """
-        Compute temporal alpha indices and return prefixed scalar values.
+        Compute temporal and spectral acoustic indices.
 
         Parameters
         ----------
         wave : np.ndarray
             Segment waveform.
         sample_rate : int
-            Waveform sampling rate.
+            Segment sample rate.
+
+        Returns
+        -------
+        dict[str, Any]
+            Dictionary with temporal and spectral acoustic indices.
+        """
+        acoustic_idx: dict[str, Any] = {}
+
+        acoustic_idx.update(self._compute_temporal_indices(wave, sample_rate))
+        acoustic_idx.update(self._compute_spectral_indices(wave, sample_rate))
+
+        return acoustic_idx
+
+    def _compute_temporal_indices(
+        self,
+        wave: np.ndarray,
+        sample_rate: int,
+    ) -> dict[str, Any]:
+        """
+        Compute temporal alpha indices.
+
+        Parameters
+        ----------
+        wave : np.ndarray
+            Segment waveform.
+        sample_rate : int
+            Segment sample rate.
 
         Returns
         -------
@@ -116,24 +113,25 @@ class AcousticIndexProcessor:
         temporal_df = features.all_temporal_alpha_indices(
             wave,
             sample_rate,
-            mode=self.mode,
-            Nt=self.nt,
             compatibility=self.compatibility,
-            verbose=False,
-            display=False,
         )
+
         return self._frame_to_prefixed_dict(temporal_df, prefix="t_")
 
-    def _compute_spectral_indices(self, wave: np.ndarray, sample_rate: int) -> dict[str, Any]:
+    def _compute_spectral_indices(
+        self,
+        wave: np.ndarray,
+        sample_rate: int,
+    ) -> dict[str, Any]:
         """
-        Compute spectral alpha indices and return prefixed scalar values.
+        Compute spectral alpha indices.
 
         Parameters
         ----------
         wave : np.ndarray
             Segment waveform.
         sample_rate : int
-            Waveform sampling rate.
+            Segment sample rate.
 
         Returns
         -------
@@ -143,30 +141,13 @@ class AcousticIndexProcessor:
         sxx_power, tn, fn, _ = sound.spectrogram(
             wave,
             sample_rate,
-            nperseg=self.nperseg,
-            noverlap=self.noverlap,
-            mode="psd",
-            verbose=False,
-            display=False,
+            flims=self.flims,
         )
 
         spectral_df, _ = features.all_spectral_alpha_indices(
             sxx_power,
             tn,
             fn,
-            flim_low=self.flim_low,
-            flim_mid=self.flim_mid,
-            flim_hi=self.flim_hi,
-            dB_threshold=self.db_threshold,
-            fmin=self.fmin,
-            fmax=self.fmax,
-            bin_step=self.bin_step,
-            flim_bioPh=self.flim_bio,
-            flim_antroPh=self.flim_anthro,
-            flim=self.flim_bioacoustics,
-            R_compatible=self.r_compatible,
-            verbose=False,
-            display=False,
         )
 
         return self._frame_to_prefixed_dict(spectral_df, prefix="s_")
@@ -174,12 +155,12 @@ class AcousticIndexProcessor:
     @staticmethod
     def _frame_to_prefixed_dict(frame: Any, prefix: str) -> dict[str, Any]:
         """
-        Convert the first row of a result DataFrame into a prefixed dictionary.
+        Convert the first row of a DataFrame-like object into a dictionary.
 
         Parameters
         ----------
         frame : Any
-            DataFrame-like object returned by maad index functions.
+            DataFrame-like object returned by maad.
         prefix : str
             Prefix added to each output key.
 
@@ -191,35 +172,61 @@ class AcousticIndexProcessor:
         if frame is None or frame.empty:
             return {}
 
-        first_row = frame.iloc[0].to_dict()
+        row = frame.iloc[0].to_dict()
+
         return {
             f"{prefix}{key}": AcousticIndexProcessor._normalize_value(value)
-            for key, value in first_row.items()
+            for key, value in row.items()
         }
 
     @staticmethod
     def _normalize_value(value: Any) -> Any:
         """
-        Normalize a value for CSV output, converting numpy scalars and handling NaN/inf.
+        Convert NumPy scalar values to Python scalars and standardize invalid values.
 
         Parameters
         ----------
         value : Any
-            Value to normalize.
+            Raw acoustic index value.
 
         Returns
         -------
         Any
-            Normalized value.
-            - NumPy scalar types are converted to native Python scalars.
-            - NaN and infinite float values are converted to None.
+            Native Python value, or None if value is NaN or infinite.
         """
         if isinstance(value, np.generic):
-            return value.item()
+            value = value.item()
 
-        if isinstance(value, float):
-            if np.isnan(value) or np.isinf(value):
-                return None
-            return value
+        if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+            return None
 
         return value
+
+    @staticmethod
+    def _validate_indices(acoustic_idx: dict[str, Any]) -> None:
+        """
+        Validate acoustic index output.
+
+        Parameters
+        ----------
+        acoustic_idx : dict[str, Any]
+            Computed acoustic index dictionary.
+
+        Raises
+        ------
+        ValueError
+            If no indices were computed or at least one value is invalid.
+        """
+        if not acoustic_idx:
+            raise ValueError("No acoustic indices were computed")
+
+        invalid_keys = [
+            key
+            for key, value in acoustic_idx.items()
+            if value is None
+        ]
+
+        if invalid_keys:
+            preview = ", ".join(invalid_keys[:10])
+            suffix = "..." if len(invalid_keys) > 10 else ""
+            raise ValueError(f"Invalid acoustic indices found: {preview}{suffix}")

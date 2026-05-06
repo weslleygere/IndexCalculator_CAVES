@@ -3,18 +3,20 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(slots=True, init=False)
 class ConfigParams:
     """
-    Typed parameter set loaded from JSON, including audio logic and indices.
-    
+    Typed parameter set loaded from a JSON configuration file.
+
     Parameters
     ----------
     params_json_path : str | Path
-        The filesystem location to the JSON definition.
+        Path to the JSON configuration file.
     """
+
     # Audio preprocessing parameters
     channel: str
     detrend: bool
@@ -24,134 +26,208 @@ class ConfigParams:
     normalize_audio: bool
     segment_tolerance_percent: float
 
-    # Spectrogram parameters
-    nperseg: int
-    noverlap: int
-
-    # Spectral indices parameters
-    flim_low: tuple[int, int]
-    flim_mid: tuple[int, int]
-    flim_hi: tuple[int, int]
-    dB_threshold: float
-    fmin: int
-    fmax: int
-    bin_step: int
-    flim_bio: tuple[int, int]
-    flim_anthro: tuple[int, int]
-    flim_bioacoustics: tuple[int, int]
-    R_compatible: str
-
-    # Temporal indices parameters
-    mode: str
-    Nt: int
+    # Index parameters
     compatibility: str
 
-    # Embedding extraction parameters
-    model_name: str
-    chunk_duration_seconds: float
-    chunk_hop_seconds: float
-    pooling: str
-    batch_size: int
-    device: str
-    use_fp16: bool
+    # Spectrogram parameters
+    flims: tuple[int, int]
 
     def __init__(self, params_json_path: str | Path) -> None:
+        payload = self._load_json(params_json_path)
 
-        with open(params_json_path, "r", encoding="utf-8") as stream:
-            payload = json.load(stream)
+        preprocess = self._get_section(payload, "preprocess")
+        spectrogram = self._get_section(payload, "spectrogram")
+        indices = self._get_section(payload, "indices")
+
+        self.channel = self._get_required(preprocess, "channel")
+        self.detrend = self._get_required(preprocess, "detrend")
+        self.segment_duration = self._get_required(preprocess, "segment_duration")
+        self.clipping_threshold = self._get_required(preprocess, "clipping_threshold")
+        self.target_sample_rate = self._get_optional(preprocess, "target_sample_rate")
+        self.normalize_audio = self._get_required(preprocess, "normalize_audio")
+        self.segment_tolerance_percent = self._get_required(
+            preprocess,
+            "segment_tolerance_percent",
+        )
+
+        self.compatibility = self._get_required(indices, "compatibility")
+        self.flims = tuple(self._get_required(spectrogram, "flims"))
+
+        self._validate()
+
+    @staticmethod
+    def _load_json(params_json_path: str | Path) -> dict[str, Any]:
+        """
+        Load a JSON configuration file.
+
+        Parameters
+        ----------
+        params_json_path : str | Path
+            Path to JSON file.
+
+        Returns
+        -------
+        dict[str, Any]
+            Parsed JSON payload.
+        """
+        path = Path(params_json_path)
 
         try:
-            preprocess = payload["preprocess"]
-            spectrogram = payload["spectrogram"]
-            spectral = payload["spectral_indices"]
-            temporal = payload["temporal_indices"]
-            embedding = payload["embeddings"]
-            
-            # Audio preprocessing parameters
-            self.channel = preprocess["channel"]
-            self.detrend = preprocess["detrend"]
-            self.segment_duration = preprocess["segment_duration"]
-            self.clipping_threshold = preprocess["clipping_threshold"]
-            self.target_sample_rate = preprocess["target_sample_rate"]
-            self.normalize_audio = preprocess["normalize_audio"]
-            self.segment_tolerance_percent = preprocess["segment_tolerance_percent"]
+            with path.open("r", encoding="utf-8") as stream:
+                payload = json.load(stream)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"Parameter JSON not found: {path}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON file: {path}") from exc
 
-            # Spectrogram parameters
-            self.nperseg = spectrogram["nperseg"]
-            self.noverlap = spectrogram["noverlap"]
+        if not isinstance(payload, dict):
+            raise ValueError("Parameter JSON root must be an object")
 
-            # Spectral indices parameters
-            self.flim_low = tuple(spectral["flim_low"])
-            self.flim_mid = tuple(spectral["flim_mid"])
-            self.flim_hi = tuple(spectral["flim_hi"])
-            self.dB_threshold = spectral["dB_threshold"]
-            self.fmin = spectral["fmin"]
-            self.fmax = spectral["fmax"]
-            self.bin_step = spectral["bin_step"]
-            self.flim_bio = tuple(spectral["flim_bio"])
-            self.flim_anthro = tuple(spectral["flim_anthro"])
-            self.flim_bioacoustics = tuple(spectral["flim_bioacoustics"])
-            self.R_compatible = spectral["R_compatible"]
+        return payload
 
-            # Temporal indices parameters
-            self.mode = temporal["mode"]
-            self.Nt = temporal["Nt"]
-            self.compatibility = temporal["compatibility"]
-            
-            # Embedding extraction parameters
-            self.model_name = embedding["model_name"]
-            self.chunk_duration_seconds = embedding["chunk_duration_seconds"]
-            self.chunk_hop_seconds = embedding["chunk_hop_seconds"]
-            self.pooling = embedding["pooling"]
-            self.batch_size = embedding["batch_size"]
-            self.device = embedding["device"]
-            self.use_fp16 = embedding["use_fp16"]
-            
-        except (KeyError, TypeError) as exc:
-            raise ValueError(f"Invalid parameter JSON structure: {exc}") from exc
+    @staticmethod
+    def _get_section(payload: dict[str, Any], section: str) -> dict[str, Any]:
+        """
+        Return a required JSON section.
 
-        self._validate_preprocess_params()
-        self._validate_embedding_params()
+        Parameters
+        ----------
+        payload : dict[str, Any]
+            Parsed JSON payload.
+        section : str
+            Section name.
 
-    def _validate_preprocess_params(self) -> None:
-        """Validate audio preprocessing parameters."""
-        if isinstance(self.segment_duration, bool) or not isinstance(self.segment_duration, int) or self.segment_duration <= 0:
+        Returns
+        -------
+        dict[str, Any]
+            Section payload.
+        """
+        value = payload.get(section)
+
+        if not isinstance(value, dict):
+            raise ValueError(f"Missing or invalid section: {section}")
+
+        return value
+
+    @staticmethod
+    def _get_required(section: dict[str, Any], key: str) -> Any:
+        """
+        Return a required section value.
+
+        Parameters
+        ----------
+        section : dict[str, Any]
+            JSON section.
+        key : str
+            Parameter name.
+
+        Returns
+        -------
+        Any
+            Parameter value.
+        """
+        if key not in section:
+            raise ValueError(f"Missing required parameter: {key}")
+
+        return section[key]
+
+    @staticmethod
+    def _get_optional(section: dict[str, Any], key: str) -> Any:
+        """
+        Return an optional section value.
+
+        Parameters
+        ----------
+        section : dict[str, Any]
+            JSON section.
+        key : str
+            Parameter name.
+
+        Returns
+        -------
+        Any
+            Parameter value or None.
+        """
+        return section.get(key)
+
+    def _validate(self) -> None:
+        """
+        Validate all loaded parameters.
+        """
+        self._validate_audio_params()
+        self._validate_index_params()
+        self._validate_spectrogram_params()
+
+    def _validate_audio_params(self) -> None:
+        """
+        Validate audio preprocessing parameters.
+        """
+        if not isinstance(self.channel, str) or not self.channel.strip():
+            raise ValueError("preprocess.channel must be a non-empty string")
+
+        if not isinstance(self.detrend, bool):
+            raise ValueError("preprocess.detrend must be boolean")
+
+        if (
+            isinstance(self.segment_duration, bool)
+            or not isinstance(self.segment_duration, int)
+            or self.segment_duration <= 0
+        ):
             raise ValueError("preprocess.segment_duration must be an integer > 0")
 
-        if isinstance(self.clipping_threshold, bool) or not isinstance(self.clipping_threshold, (int, float)) or self.clipping_threshold < 0.0 or self.clipping_threshold > 1.0:
+        if (
+            isinstance(self.clipping_threshold, bool)
+            or not isinstance(self.clipping_threshold, (int, float))
+            or not 0.0 <= float(self.clipping_threshold) <= 1.0
+        ):
             raise ValueError("preprocess.clipping_threshold must be between 0 and 1")
 
+        self.clipping_threshold = float(self.clipping_threshold)
+
         if self.target_sample_rate is not None:
-            if isinstance(self.target_sample_rate, bool) or not isinstance(self.target_sample_rate, int) or self.target_sample_rate <= 0:
-                raise ValueError("preprocess.target_sample_rate must be null or an integer > 0. Common values are 22050, 44100, or 48000")
+            if (
+                isinstance(self.target_sample_rate, bool)
+                or not isinstance(self.target_sample_rate, int)
+                or self.target_sample_rate <= 0
+            ):
+                raise ValueError(
+                    "preprocess.target_sample_rate must be null or an integer > 0"
+                )
 
         if not isinstance(self.normalize_audio, bool):
             raise ValueError("preprocess.normalize_audio must be boolean")
 
-        if isinstance(self.segment_tolerance_percent, bool) or not isinstance(self.segment_tolerance_percent, (int, float)) or self.segment_tolerance_percent < 0.0 or self.segment_tolerance_percent > 100.0:
-            raise ValueError("preprocess.segment_tolerance_percent must be between 0 and 100")
+        if (
+            isinstance(self.segment_tolerance_percent, bool)
+            or not isinstance(self.segment_tolerance_percent, (int, float))
+            or not 0.0 <= float(self.segment_tolerance_percent) <= 100.0
+        ):
+            raise ValueError(
+                "preprocess.segment_tolerance_percent must be between 0 and 100"
+            )
 
-    def _validate_embedding_params(self) -> None:
-        """Validate embedding extraction parameters."""
-        if not isinstance(self.model_name, str) or not self.model_name.strip():
-            raise ValueError("embeddings.model_name must be a non-empty string")
+        self.segment_tolerance_percent = float(self.segment_tolerance_percent)
 
-        if not isinstance(self.chunk_duration_seconds, (int, float)) or self.chunk_duration_seconds <= 0:
-            raise ValueError("embeddings.chunk_duration_seconds must be > 0")
+    def _validate_index_params(self) -> None:
+        """
+        Validate acoustic index parameters.
+        """
+        if not isinstance(self.compatibility, str) or not self.compatibility.strip():
+            raise ValueError("indices.compatibility must be a non-empty string")
 
-        if not isinstance(self.chunk_hop_seconds, (int, float)) or self.chunk_hop_seconds <= 0:
-            raise ValueError("embeddings.chunk_hop_seconds must be > 0")
+    def _validate_spectrogram_params(self) -> None:
+        """
+        Validate spectrogram parameters.
+        """
+        if (
+            not isinstance(self.flims, tuple)
+            or len(self.flims) != 2
+            or any(isinstance(value, bool) for value in self.flims)
+            or not all(isinstance(value, int) for value in self.flims)
+        ):
+            raise ValueError("spectrogram.flims must be a list with two integers")
 
-        self.pooling = str(self.pooling).strip().lower()
-        if self.pooling not in {"mean", "mean_std"}:
-            raise ValueError("embeddings.pooling must be one of: mean, mean_std")
+        low, high = self.flims
 
-        if not isinstance(self.batch_size, int) or self.batch_size <= 0:
-            raise ValueError("embeddings.batch_size must be an integer > 0")
-
-        self.device = str(self.device).strip().lower()
-        if self.device not in {"auto", "cpu", "cuda"}:
-            raise ValueError("embeddings.device must be one of: auto, cpu, cuda")
-
-        if not isinstance(self.use_fp16, bool):
-            raise ValueError("embeddings.use_fp16 must be boolean")
+        if low < 0 or high <= low:
+            raise ValueError("spectrogram.flims must satisfy 0 <= low < high")

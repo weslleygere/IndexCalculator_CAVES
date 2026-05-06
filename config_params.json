@@ -8,35 +8,10 @@
     "normalize_audio": false,
     "segment_tolerance_percent": 1.0
   },
-  "spectrogram": {
-    "nperseg": 1024,
-    "noverlap": 512
-  },
-  "spectral_indices": {
-    "flim_low": [0, 2000],
-    "flim_mid": [2000, 8000],
-    "flim_hi": [8000, 12000],
-    "dB_threshold": -50.0,
-    "fmin": 0,
-    "fmax": 12000,
-    "bin_step": 1000,
-    "flim_anthro": [0, 2000],
-    "flim_bio": [2000, 12000],
-    "flim_bioacoustics": [2000, 12000],
-    "R_compatible": "soundecology"
-  },
-  "temporal_indices": {
-    "mode": "fast",
-    "Nt": 1024,
+  "indices": {
     "compatibility": "seewave"
   },
-    "embeddings": {
-      "model_name": "laion/clap-htsat-unfused",
-      "chunk_duration_seconds": 10.0,
-      "chunk_hop_seconds": 10.0,
-      "pooling": "mean_std",
-      "batch_size": 16,
-      "device": "cuda",
-      "use_fp16": true
+  "spectrogram": {
+    "flims": [0, 20000]
   }
 }
