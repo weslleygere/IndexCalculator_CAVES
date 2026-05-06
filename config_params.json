@@ -1,0 +1,17 @@
+{
+  "preprocess": {
+    "channel": "right",
+    "detrend": true,
+    "segment_duration": 60,
+    "clipping_threshold": 0.98,
+    "target_sample_rate": null,
+    "normalize_audio": false,
+    "segment_tolerance_percent": 1.0
+  },
+  "indices": {
+    "compatibility": "seewave"
+  },
+  "spectrogram": {
+    "flims": [0, 20000]
+  }
+}
